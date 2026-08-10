@@ -6298,16 +6298,6 @@ _UNCONVERTIBLE_PREFIX_ITEMS_SCHEMAS = [
         },
         id='mismatch-after-first-pair',
     ),
-    pytest.param(
-        {
-            'type': 'array',
-            'prefixItems': [{'type': 'integer'}],
-            'items': {'type': 'string'},
-            'minItems': 1,
-            'maxItems': 1,
-        },
-        id='prefix-items-plus-items',
-    ),
 ]
 
 
@@ -6337,6 +6327,33 @@ def test_transformer_unconvertible_prefix_items_explicit_strict_raises(array_sch
     }
     with pytest.raises(UserError, match='OpenAI strict mode does not support `prefixItems`'):
         OpenAIJsonSchemaTransformer(schema, strict=True).walk()
+
+
+@pytest.mark.parametrize('strict', [None, True])
+def test_transformer_homogeneous_prefix_items_with_unreachable_items_rewritten(strict: bool | None):
+    """When `maxItems` caps the array at `prefixItems` length, `items` cannot apply and can be replaced."""
+    schema: dict[str, Any] = {
+        'type': 'object',
+        'properties': {
+            'value': {
+                'type': 'array',
+                'prefixItems': [{'type': 'integer'}],
+                'items': {'type': 'string'},
+                'minItems': 1,
+                'maxItems': 1,
+            }
+        },
+        'required': ['value'],
+    }
+    transformer = OpenAIJsonSchemaTransformer(schema, strict=strict)
+
+    assert transformer.walk()['properties']['value'] == {
+        'type': 'array',
+        'items': {'type': 'integer'},
+        'minItems': 1,
+        'maxItems': 1,
+    }
+    assert transformer.is_strict_compatible is True
 
 
 def test_transformer_named_tuple_with_defaults_rewritten_for_strict_mode():

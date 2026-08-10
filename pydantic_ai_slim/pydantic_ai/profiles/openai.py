@@ -572,15 +572,16 @@ class OpenAIJsonSchemaTransformer(JsonSchemaTransformer):
         if schema_type == 'array':
             # OpenAI strict mode does not support `prefixItems` (tuple types). A homogeneous
             # length-capped tuple (e.g. `tuple[int, int]`) is rewritten to the equivalent supported
-            # `items` + `minItems`/`maxItems` form; any other `prefixItems` schema can't be rewritten
-            # without changing its meaning, so it's not strict-compatible.
+            # `items` + `minItems`/`maxItems` form. An `items` schema is safe to replace when
+            # `maxItems` caps the array at the prefix length because it can never apply; otherwise,
+            # any other `prefixItems` schema can't be rewritten without changing its meaning.
             # See https://github.com/pydantic/pydantic-ai/issues/7315
             prefix_items = schema.get('prefixItems')
             if prefix_items is not None and self.strict is not False:
                 if not prefix_items:
                     # empty `prefixItems` constrains nothing
                     del schema['prefixItems']
-                elif 'items' not in schema and _is_homogeneous_bounded_tuple(schema, prefix_items):
+                elif _is_homogeneous_bounded_tuple(schema, prefix_items):
                     schema['items'] = prefix_items[0]
                     del schema['prefixItems']
                 elif self.strict is True:
