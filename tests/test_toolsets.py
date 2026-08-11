@@ -1761,6 +1761,37 @@ async def test_combined_toolset_instructions_empty():
     assert instructions is None
 
 
+async def test_combined_toolset_passes_prepared_tool_definition_to_source():
+    """Prepared tool definitions should reach the source toolset when a toolset is combined."""
+    received_metadata: list[dict[str, Any] | None] = []
+
+    class RecordingToolset(FunctionToolset[None]):
+        async def call_tool(
+            self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
+        ) -> Any:
+            received_metadata.append(tool.tool_def.metadata)
+            return await super().call_tool(name, tool_args, ctx, tool)
+
+    source_toolset = RecordingToolset()
+
+    @source_toolset.tool_plain
+    def my_tool() -> str:
+        return 'ok'
+
+    def prepare_tools(ctx: RunContext[None], tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
+        return [replace(tool_def, metadata={'prepared': True}) for tool_def in tool_defs]
+
+    combined = CombinedToolset([source_toolset, FunctionToolset()])
+    prepared = PreparedToolset(combined, prepare_tools)
+    ctx = build_run_context(None)
+    tool_manager = await ToolManager[None](prepared).for_run_step(ctx)
+
+    result = await tool_manager.handle_call(ToolCallPart(tool_name='my_tool', args={}))
+
+    assert result == 'ok'
+    assert received_metadata == [{'prepared': True}]
+
+
 def test_agent_toolset_decorator_id():
     """Test that @agent.toolset decorator requires explicit id or defaults to None."""
     from pydantic_ai.models.test import TestModel
