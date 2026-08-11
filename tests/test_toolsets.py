@@ -317,6 +317,34 @@ async def test_prepared_toolset_sync_prepare_func():
     assert list(tools.keys()) == ['add']
 
 
+async def test_prepared_toolset_preserves_tool_def_through_combined_toolset():
+    """Prepared tool definitions are passed to the underlying toolset when combined."""
+
+    class RecordingToolset(FunctionToolset[None]):
+        received_metadata: dict[str, Any] | None = None
+
+        async def call_tool(
+            self, name: str, tool_args: dict[str, Any], ctx: RunContext[None], tool: ToolsetTool[None]
+        ) -> Any:
+            self.received_metadata = tool.tool_def.metadata
+            return await super().call_tool(name, tool_args, ctx, tool)
+
+    base_toolset = RecordingToolset()
+
+    @base_toolset.tool_plain
+    def add(a: int, b: int) -> int:
+        return a + b
+
+    def prepare_add_metadata(ctx: RunContext, tool_defs: list[ToolDefinition]) -> list[ToolDefinition]:
+        return [replace(tool_def, metadata={'source': 'prepared'}) for tool_def in tool_defs]
+
+    prepared_toolset = PreparedToolset(CombinedToolset([base_toolset]), prepare_add_metadata)
+    tool_manager = await ToolManager(prepared_toolset).for_run_step(build_run_context(None))
+
+    assert await tool_manager.handle_call(ToolCallPart(tool_name='add', args={'a': 1, 'b': 2})) == 3
+    assert base_toolset.received_metadata == {'source': 'prepared'}
+
+
 async def test_prepared_toolset_user_error_none_result():
     """`PreparedToolset` requires [] when a prepare function intentionally exposes no tools."""
     base_toolset = FunctionToolset()
