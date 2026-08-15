@@ -149,6 +149,125 @@ async def test_openrouter_cache_messages_empty_content_no_crash() -> None:
     assert content == []
 
 
+# ===== Prompt caching: leading CachePoint on a later user part =====
+# These pin the pre-request message rewrite directly: a VCR test could only observe the
+# relocated `cache_control` on the wire, and only for the one recorded provider, while the
+# rewrite itself (which request's user message carries the boundary) is decided before any
+# request is made.
+
+
+async def test_openrouter_leading_cache_point_on_later_user_prompt_attaches_to_previous() -> None:
+    """A `CachePoint` opening a later `UserPromptPart` lands on the end of the preceding user part.
+
+    `[UserPromptPart('Hello'), UserPromptPart([CachePoint(), 'reminder'])]` used to raise, even
+    though the boundary is well defined: everything before the marker is the end of the first
+    part, so that is where `cache_control` belongs.
+    """
+    model = OpenRouterModel('anthropic/claude-sonnet-4.6', provider=OpenRouterProvider(api_key='test-key'))
+    params = ModelRequestParameters(instruction_parts=[])
+
+    mapped = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        [ModelRequest(parts=[UserPromptPart(content='Hello'), UserPromptPart(content=[CachePoint(), 'reminder'])])],
+        params,
+    )
+
+    assert mapped == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': 'Hello', 'cache_control': {'type': 'ephemeral', 'ttl': '5m'}},
+                ],
+            },
+            {'role': 'user', 'content': [{'type': 'text', 'text': 'reminder'}]},
+        ]
+    )
+
+
+async def test_openrouter_cache_point_only_later_user_prompt_emits_no_message() -> None:
+    """A later user part that contains only a `CachePoint` emits no user message.
+
+    Once the marker is relocated to the preceding part, the part itself has nothing left to
+    send; emitting an empty user message would be rejected by the API.
+    """
+    model = OpenRouterModel('anthropic/claude-sonnet-4.6', provider=OpenRouterProvider(api_key='test-key'))
+    params = ModelRequestParameters(instruction_parts=[])
+
+    mapped = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        [ModelRequest(parts=[UserPromptPart(content='Hello'), UserPromptPart(content=[CachePoint()])])],
+        params,
+    )
+
+    assert mapped == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': 'Hello', 'cache_control': {'type': 'ephemeral', 'ttl': '5m'}},
+                ],
+            },
+        ]
+    )
+
+
+async def test_openrouter_leading_cache_point_on_later_request_attaches_to_previous() -> None:
+    """A `CachePoint` opening a later request's user part lands on the previous request's user message.
+
+    The relocation spans requests: the boundary is the end of the last user message of the whole
+    conversation, not just of the current request.
+    """
+    model = OpenRouterModel('anthropic/claude-sonnet-4.6', provider=OpenRouterProvider(api_key='test-key'))
+    params = ModelRequestParameters(instruction_parts=[])
+
+    mapped = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        [
+            ModelRequest(parts=[UserPromptPart(content='Hello')]),
+            ModelResponse(parts=[TextPart(content='Hi there')]),
+            ModelRequest(parts=[UserPromptPart(content=[CachePoint(), 'reminder'])]),
+        ],
+        params,
+    )
+
+    assert mapped == snapshot(
+        [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': 'Hello', 'cache_control': {'type': 'ephemeral', 'ttl': '5m'}},
+                ],
+            },
+            {'role': 'assistant', 'content': 'Hi there'},
+            {'role': 'user', 'content': [{'type': 'text', 'text': 'reminder'}]},
+        ]
+    )
+
+
+async def test_openrouter_leading_cache_point_ignored_without_cache_control_support() -> None:
+    """Providers without `cache_control` support keep ignoring leading `CachePoint`s (no rewrite, no raise).
+
+    Pins the flag-off side of the `openrouter_supports_cache_control` branch in
+    `_map_messages`: the marker is dropped and the parts map as they always have.
+    """
+    model = OpenRouterModel(
+        'anthropic/claude-sonnet-4.6',
+        provider=OpenRouterProvider(api_key='test-key'),
+        profile=OpenRouterModelProfile(openrouter_supports_cache_control=False),
+    )
+    params = ModelRequestParameters(instruction_parts=[])
+
+    mapped = await model._map_messages(  # pyright: ignore[reportPrivateUsage]
+        [ModelRequest(parts=[UserPromptPart(content='Hello'), UserPromptPart(content=[CachePoint(), 'reminder'])])],
+        params,
+    )
+
+    assert mapped == snapshot(
+        [
+            {'role': 'user', 'content': 'Hello'},
+            {'role': 'user', 'content': [{'type': 'text', 'text': 'reminder'}]},
+        ]
+    )
+
+
 # ===== Prompt caching: public-API wire-shape tests (cassettes) =====
 # Each runs through `Agent.run()` against the real OpenRouter API and asserts the `cache_control`
 # breakpoints on the recorded request body. These replace the former private-method unit tests

@@ -1,7 +1,7 @@
 from __future__ import annotations as _annotations
 
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import Annotated, Any, Literal, TypeAlias, cast
 
@@ -15,9 +15,12 @@ from ..messages import (
     CachePoint,
     FinishReason,
     ModelMessage,
+    ModelRequest,
+    ModelRequestPart,
     ModelResponseStreamEvent,
     ThinkingPart,
     UserContent,
+    UserPromptPart,
     VideoUrl,
 )
 from ..native_tools import AbstractNativeTool, AdvisorTool, WebSearchTool
@@ -654,6 +657,90 @@ def _openrouter_settings_to_openai_settings(
     return OpenAIChatModelSettings(**model_settings)  # type: ignore[reportCallIssue]
 
 
+def _move_leading_cache_points_to_previous_user_part(
+    messages: Sequence[ModelMessage],
+) -> Sequence[ModelMessage]:
+    """Relocate `CachePoint`s that open a later user part onto the end of the preceding user part.
+
+    A `CachePoint` asks to cache everything up to that point. When it is the first item of a
+    `UserPromptPart` it has no content of its own to attach to, but the boundary is still well
+    defined whenever an earlier user part exists: the end of that part is everything the marker
+    is meant to cache. Moving the marker there lets the normal mapping emit `cache_control` on
+    real content; a `CachePoint` with no preceding user content anywhere is left in place and
+    raises the usual "first content" error.
+
+    Returns a new sequence with the affected requests rebuilt, or `messages` unchanged when
+    there is nothing to relocate.
+    """
+    # Track the most recent `UserPromptPart` across all requests: assistant responses and
+    # tool results in between don't change which user message a marker follows.
+    last_user_part: tuple[int, int] | None = None
+    new_parts_by_request: dict[int, list[ModelRequestPart]] = {}
+    dropped_parts: set[tuple[int, int]] = set()
+
+    for request_index, message in enumerate(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        for part_index, part in enumerate(message.parts):
+            if not isinstance(part, UserPromptPart):
+                continue
+            content = part.content
+            if not isinstance(content, str) and content and isinstance(content[0], CachePoint):
+                if last_user_part is None:
+                    # No earlier user content to attach to: leave the marker in place so the
+                    # mapping raises the usual "first content" error.
+                    last_user_part = (request_index, part_index)
+                    continue
+
+                leading: list[CachePoint] = []
+                rest: list[UserContent] = []
+                for item in content:
+                    if isinstance(item, CachePoint):
+                        leading.append(item)
+                    else:
+                        rest.append(item)
+
+                # Everything before the marker is what it asks to cache: the boundary lands at
+                # the end of the preceding user part.
+                previous_request_index, previous_part_index = last_user_part
+                previous_request = messages[previous_request_index]
+                assert isinstance(previous_request, ModelRequest)
+                previous_parts = new_parts_by_request.setdefault(previous_request_index, list(previous_request.parts))
+                previous_part = previous_parts[previous_part_index]
+                assert isinstance(previous_part, UserPromptPart)
+                previous_content = previous_part.content
+                previous_parts[previous_part_index] = replace(
+                    previous_part,
+                    content=(
+                        [previous_content, *leading]
+                        if isinstance(previous_content, str)
+                        else [*previous_content, *leading]
+                    ),
+                )
+
+                if rest:
+                    parts = new_parts_by_request.setdefault(request_index, list(message.parts))
+                    parts[part_index] = replace(part, content=rest)
+                    last_user_part = (request_index, part_index)
+                else:
+                    # The part contained only cache points and now has nothing left to send.
+                    dropped_parts.add((request_index, part_index))
+                continue
+            last_user_part = (request_index, part_index)
+
+    if not new_parts_by_request:
+        return messages
+
+    rewritten = list(messages)
+    for request_index, parts in new_parts_by_request.items():
+        if dropped_parts:
+            parts = [p for index, p in enumerate(parts) if (request_index, index) not in dropped_parts]
+        request = messages[request_index]
+        assert isinstance(request, ModelRequest)
+        rewritten[request_index] = replace(request, parts=parts)
+    return rewritten
+
+
 class OpenRouterModel(OpenAIChatModel):
     """Extends OpenAIChatModel to capture extra metadata for Openrouter."""
 
@@ -987,6 +1074,13 @@ class OpenRouterModel(OpenAIChatModel):
         *,
         model_settings: ModelSettings | None = None,
     ) -> list[chat.ChatCompletionMessageParam]:
+        if self._resolved_profile.get('openrouter_supports_cache_control', False):
+            # A `CachePoint` that opens a later user part has nothing in its own part to attach
+            # to. When the provider supports `cache_control`, relocate the marker onto the end
+            # of the preceding user part (see `_move_leading_cache_points_to_previous_user_part`);
+            # providers that ignore `CachePoint`s keep their current behavior.
+            messages = _move_leading_cache_points_to_previous_user_part(messages)
+
         openai_messages = await super()._map_messages(messages, model_request_parameters, model_settings=model_settings)
 
         if (
